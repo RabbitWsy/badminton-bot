@@ -43,9 +43,11 @@ class Config:
     timezone: str
     open_time: str
     wait_until_open: bool
+    pre_open_refresh_ms: int
     retry_until_seconds: float
     retry_interval_seconds: float
     page_settle_timeout_ms: int
+    submit_result_timeout_ms: int
     headless: bool
     slow_mo_ms: int
     browser_channel: str
@@ -105,9 +107,11 @@ def load_config(env_file: Path) -> Config:
         timezone=os.getenv("FUDAN_TIMEZONE", "Asia/Shanghai").strip(),
         open_time=os.getenv("FUDAN_OPEN_TIME", "07:00:00").strip(),
         wait_until_open=parse_bool(os.getenv("FUDAN_WAIT_UNTIL_OPEN"), True),
+        pre_open_refresh_ms=int(os.getenv("FUDAN_PRE_OPEN_REFRESH_MS", "1800")),
         retry_until_seconds=float(os.getenv("FUDAN_RETRY_UNTIL_SECONDS", "45")),
         retry_interval_seconds=float(os.getenv("FUDAN_RETRY_INTERVAL_SECONDS", "0.5")),
         page_settle_timeout_ms=int(os.getenv("FUDAN_PAGE_SETTLE_TIMEOUT_MS", "1200")),
+        submit_result_timeout_ms=int(os.getenv("FUDAN_SUBMIT_RESULT_TIMEOUT_MS", "1500")),
         headless=parse_bool(os.getenv("FUDAN_HEADLESS"), True),
         slow_mo_ms=int(os.getenv("FUDAN_SLOW_MO_MS", "0")),
         browser_channel=os.getenv("FUDAN_BROWSER_CHANNEL", "").strip(),
@@ -163,8 +167,9 @@ class FudanBadmintonBot:
                 if not self.is_booking_page():
                     self.open_venue()
                 if self.config.wait_until_open:
-                    self.wait_until_open_time()
+                    self.wait_until_pre_open_refresh()
                     self.refresh_booking_page()
+                    self.wait_until_open_time()
 
                 booked = self.book_with_retries()
                 if booked:
@@ -317,6 +322,19 @@ class FudanBadmintonBot:
         self.log(f"等待开放时间 {open_dt.strftime('%H:%M:%S')}，剩余 {seconds:.1f} 秒。")
         time.sleep(seconds)
 
+    def wait_until_pre_open_refresh(self) -> None:
+        open_dt = self.today_open_datetime()
+        lead = max(0, self.config.pre_open_refresh_ms) / 1000
+        refresh_dt = open_dt - timedelta(seconds=lead)
+        now = datetime.now(self.tz)
+        if now < refresh_dt:
+            seconds = (refresh_dt - now).total_seconds()
+            self.log(
+                f"等待开放前刷新时间 {refresh_dt.strftime('%H:%M:%S.%f')[:-3]}，"
+                f"剩余 {seconds:.1f} 秒。"
+            )
+            time.sleep(seconds)
+
     def today_open_datetime(self) -> datetime:
         parts = [int(part) for part in self.config.open_time.split(":")]
         if len(parts) == 2:
@@ -347,6 +365,9 @@ class FudanBadmintonBot:
                 result = self.click_slot(scope, slot)
                 status = result.get("status")
                 text = result.get("text", "")
+                if status == "click-point":
+                    self.page.mouse.click(float(result["x"]), float(result["y"]))
+                    status = "clicked"
                 if status == "clicked":
                     if self.submit_booking(slot):
                         booked.append(slot)
@@ -478,21 +499,7 @@ class FudanBadmintonBot:
               return { status: 'unavailable', text };
             }
             if (dryRun) return { status: 'would-click', text };
-
-            let clickTarget = cell;
-            for (let depth = 0; depth < 5 && clickTarget; depth += 1, clickTarget = clickTarget.parentElement) {
-              const candidates = Array.from(clickTarget.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"], *'))
-                .filter((element) => visible(element) && !element.disabled && element.getAttribute('aria-disabled') !== 'true');
-              const active = candidates.find((element) => !disabledText.test(normalize(element.innerText || element.value || element.textContent)));
-              if (active) {
-                active.scrollIntoView({ block: 'center', inline: 'center' });
-                active.click();
-                return { status: 'clicked', text };
-              }
-            }
-            cell.scrollIntoView({ block: 'center', inline: 'center' });
-            cell.click();
-            return { status: 'clicked', text };
+            return { status: 'click-point', text, x: pointX, y: pointY };
           }
           return { status: 'not-found', text: '' };
         }
@@ -514,17 +521,87 @@ class FudanBadmintonBot:
             return False
 
         self.click_first_text(["确定", "确认", "我知道了"], required=False)
-        time.sleep(0.8)
-        body_text = self.current_text()
-        if any(word in body_text for word in ["预约成功", "提交成功", "成功预约", "预约已提交"]):
+        success, feedback = self.wait_for_submit_result(slot)
+        if success:
             self.log(f"{slot} 预约成功。")
             return True
-
-        # 有些页面成功后只刷新“我的预约”，没有明显提示；保守地把已点击提交视作成功。
-        if not any(word in body_text for word in ["失败", "错误", "已满", "不可预约", "未开放"]):
-            self.log(f"{slot} 已提交，页面未返回明确失败。")
-            return True
+        if feedback:
+            self.log(f"{slot} 提交后未成功，页面反馈: {feedback[:160]}")
         return False
+
+    def wait_for_submit_result(self, slot: str) -> tuple[bool, str]:
+        timeout_ms = self.config.submit_result_timeout_ms
+        deadline = time.time() + timeout_ms / 1000
+        last_feedback = ""
+        success_words = ["预约成功", "提交成功", "成功预约", "预约已提交"]
+        failure_words = ["失败", "错误", "约满", "已满", "不可预约", "未开放", "冲突", "重复", "超过"]
+
+        while time.time() <= deadline:
+            feedback = self.feedback_text()
+            if feedback:
+                last_feedback = feedback
+                if any(word in feedback for word in success_words):
+                    return True, feedback
+                if any(word in feedback for word in failure_words):
+                    return False, feedback
+
+            body_text = self.current_text(timeout_ms=300)
+            if any(word in body_text for word in success_words):
+                return True, feedback or "检测到成功提示"
+            if (
+                "我的预约" in body_text
+                and self.target_date in body_text
+                and slot in body_text
+                and any(word in body_text for word in ["已预约", "待签到"])
+            ):
+                return True, "检测到我的预约记录"
+            time.sleep(0.1)
+
+        return False, last_feedback
+
+    def feedback_text(self) -> str:
+        script = """
+        () => {
+          const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+          const visible = (element) => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.visibility !== 'hidden' && style.display !== 'none'
+              && rect.width > 0 && rect.height > 0;
+          };
+          const selectors = [
+            '.el-message',
+            '.el-notification',
+            '.el-dialog',
+            '.ant-message',
+            '.ant-notification',
+            '.ant-modal',
+            '[role="alert"]',
+            '[role="dialog"]',
+            '.toast',
+            '.modal'
+          ];
+          const texts = [];
+          for (const selector of selectors) {
+            for (const element of document.querySelectorAll(selector)) {
+              if (visible(element)) {
+                const text = normalize(element.innerText || element.textContent);
+                if (text) texts.push(text);
+              }
+            }
+          }
+          return Array.from(new Set(texts)).join(' | ');
+        }
+        """
+        chunks = []
+        for scope in self.scopes():
+            try:
+                text = scope.evaluate(script)
+            except Exception:
+                continue
+            if text:
+                chunks.append(text)
+        return " | ".join(chunks)
 
     def fill_phone_if_needed(self) -> None:
         if not self.config.phone:
@@ -581,12 +658,15 @@ class FudanBadmintonBot:
             {"text": "确定", "exact": True},
             {"text": "预约", "exact": True},
         ]
-        for scope in self.scopes():
-            try:
-                if scope.evaluate(script, labels):
-                    return True
-            except Exception:
-                continue
+        deadline = time.time() + 0.6
+        while time.time() <= deadline:
+            for scope in self.scopes():
+                try:
+                    if scope.evaluate(script, labels):
+                        return True
+                except Exception:
+                    continue
+            time.sleep(0.05)
         return False
 
     def refresh_booking_page(self) -> None:
