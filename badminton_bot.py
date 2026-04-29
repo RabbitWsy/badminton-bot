@@ -48,6 +48,7 @@ class Config:
     retry_interval_seconds: float
     page_settle_timeout_ms: int
     submit_result_timeout_ms: int
+    force_login: bool
     headless: bool
     slow_mo_ms: int
     browser_channel: str
@@ -112,6 +113,7 @@ def load_config(env_file: Path) -> Config:
         retry_interval_seconds=float(os.getenv("FUDAN_RETRY_INTERVAL_SECONDS", "0.5")),
         page_settle_timeout_ms=int(os.getenv("FUDAN_PAGE_SETTLE_TIMEOUT_MS", "1200")),
         submit_result_timeout_ms=int(os.getenv("FUDAN_SUBMIT_RESULT_TIMEOUT_MS", "1500")),
+        force_login=parse_bool(os.getenv("FUDAN_FORCE_LOGIN"), True),
         headless=parse_bool(os.getenv("FUDAN_HEADLESS"), True),
         slow_mo_ms=int(os.getenv("FUDAN_SLOW_MO_MS", "0")),
         browser_channel=os.getenv("FUDAN_BROWSER_CHANNEL", "").strip(),
@@ -148,7 +150,7 @@ class FudanBadmintonBot:
                 "locale": "zh-CN",
                 "timezone_id": self.config.timezone,
             }
-            if self.config.storage_state.exists():
+            if self.config.storage_state.exists() and not self.config.force_login:
                 context_kwargs["storage_state"] = str(self.config.storage_state)
 
             context = browser.new_context(**context_kwargs)
@@ -157,6 +159,8 @@ class FudanBadmintonBot:
             self.page = context.new_page()
 
             try:
+                if self.config.force_login:
+                    self.log("本次运行强制重新登录，不使用旧 storage_state 启动。")
                 self.open_venue()
                 self.login_if_needed()
                 context.storage_state(path=str(self.config.storage_state))
@@ -355,7 +359,15 @@ class FudanBadmintonBot:
 
             attempt += 1
             self.log(f"第 {attempt} 次检查 {self.target_date} 的可预约时段。")
-            scope = self.ensure_target_date_visible()
+            try:
+                scope = self.ensure_target_date_visible()
+            except BotError as exc:
+                if "没有在预约表格中找到目标日期" not in str(exc):
+                    raise
+                self.log(f"暂未找到目标日期 {self.target_date}，刷新后继续重试。")
+                time.sleep(max(0.1, self.config.retry_interval_seconds))
+                self.refresh_booking_page()
+                continue
             for slot in self.config.preferred_slots:
                 if len(booked) >= self.config.max_slots:
                     break

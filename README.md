@@ -60,6 +60,7 @@ FUDAN_CONTAINER_START_TIME=06:58:30
 FUDAN_OPEN_TIME=07:00:00
 FUDAN_PRE_OPEN_REFRESH_MS=1800
 FUDAN_SUBMIT_RESULT_TIMEOUT_MS=1500
+FUDAN_FORCE_LOGIN=true
 ```
 
 实际部署时，让容器的主进程执行 `bash scripts/run-daily.sh`，或者在 `tmux`/`screen`/`nohup` 中运行它。
@@ -103,6 +104,8 @@ FUDAN_PREFERRED_SLOTS=21:00-22:30,20:00-21:00,19:00-20:00,18:00-19:00,17:00-18:0
 ```
 
 预约成功后，脚本会重新打开 `FUDAN_VENUE_URL`，继续尝试下一个时段。
+
+默认 `FUDAN_FORCE_LOGIN=true`，每天运行都会忽略旧 `storage_state.json` 先重新登录一次，并在登录成功后覆盖写入新的 `storage_state.json`。这样学校 cookie 两天失效也不会影响当天运行；同一轮抢场里的刷新仍然使用当前浏览器会话。
 
 ## 项目文件
 
