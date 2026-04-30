@@ -43,7 +43,6 @@ class Config:
     timezone: str
     open_time: str
     wait_until_open: bool
-    pre_open_refresh_ms: int
     retry_until_seconds: float
     retry_interval_seconds: float
     page_settle_timeout_ms: int
@@ -108,7 +107,6 @@ def load_config(env_file: Path) -> Config:
         timezone=os.getenv("FUDAN_TIMEZONE", "Asia/Shanghai").strip(),
         open_time=os.getenv("FUDAN_OPEN_TIME", "07:00:00").strip(),
         wait_until_open=parse_bool(os.getenv("FUDAN_WAIT_UNTIL_OPEN"), True),
-        pre_open_refresh_ms=int(os.getenv("FUDAN_PRE_OPEN_REFRESH_MS", "1800")),
         retry_until_seconds=float(os.getenv("FUDAN_RETRY_UNTIL_SECONDS", "45")),
         retry_interval_seconds=float(os.getenv("FUDAN_RETRY_INTERVAL_SECONDS", "0.5")),
         page_settle_timeout_ms=int(os.getenv("FUDAN_PAGE_SETTLE_TIMEOUT_MS", "1200")),
@@ -171,9 +169,8 @@ class FudanBadmintonBot:
                 if not self.is_booking_page():
                     self.open_venue()
                 if self.config.wait_until_open:
-                    self.wait_until_pre_open_refresh()
-                    self.refresh_booking_page()
                     self.wait_until_open_time()
+                    self.refresh_booking_page()
 
                 booked = self.book_with_retries()
                 if booked:
@@ -326,19 +323,6 @@ class FudanBadmintonBot:
         self.log(f"等待开放时间 {open_dt.strftime('%H:%M:%S')}，剩余 {seconds:.1f} 秒。")
         time.sleep(seconds)
 
-    def wait_until_pre_open_refresh(self) -> None:
-        open_dt = self.today_open_datetime()
-        lead = max(0, self.config.pre_open_refresh_ms) / 1000
-        refresh_dt = open_dt - timedelta(seconds=lead)
-        now = datetime.now(self.tz)
-        if now < refresh_dt:
-            seconds = (refresh_dt - now).total_seconds()
-            self.log(
-                f"等待开放前刷新时间 {refresh_dt.strftime('%H:%M:%S.%f')[:-3]}，"
-                f"剩余 {seconds:.1f} 秒。"
-            )
-            time.sleep(seconds)
-
     def today_open_datetime(self) -> datetime:
         parts = [int(part) for part in self.config.open_time.split(":")]
         if len(parts) == 2:
@@ -368,6 +352,7 @@ class FudanBadmintonBot:
                 time.sleep(max(0.1, self.config.retry_interval_seconds))
                 self.refresh_booking_page()
                 continue
+            should_refresh_immediately = False
             for slot in self.config.preferred_slots:
                 if len(booked) >= self.config.max_slots:
                     break
@@ -393,8 +378,16 @@ class FudanBadmintonBot:
                     self.log(f"[dry-run] 会尝试预约 {slot}，单元格文本: {text}")
                 elif status == "unavailable":
                     self.log(f"{slot} 不可预约: {text}")
+                    if "未开放" in text and datetime.now(self.tz) >= self.today_open_datetime():
+                        should_refresh_immediately = True
+                        self.log("目标日期仍显示未开放，立即刷新后重试。")
+                        break
                 elif status != "not-found":
                     self.log(f"{slot} 跳过: {status} {text}")
+
+            if should_refresh_immediately:
+                self.refresh_booking_page()
+                continue
 
             if self.dry_run:
                 break

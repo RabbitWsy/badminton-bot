@@ -17,7 +17,7 @@ https://booking.fudan.edu.cn/reservation/fe/site/reservationInfo?id=1055
 - 时段：默认只抢 15:00 及以后。
 - 优先级：`21:00-22:30`、`20:00-21:00`、`19:00-20:00`、`18:00-19:00`、`17:00-18:00`、`16:00-17:00`、`15:00-16:00`。
 - 数量：最多 3 个时段。
-- 执行方式：容器常驻进程默认每天 `06:58:30` 启动一次任务，提前进入预约页，脚本默认在开放前约 `1.8s` 刷新，随后从 `07:00:00` 开始点击。
+- 执行方式：容器常驻进程默认每天 `06:58:30` 启动一次任务，提前登录并进入预约页，等到 `07:00:00` 后刷新预约页并开始点击。
 
 ## 容器部署
 
@@ -58,7 +58,6 @@ bash scripts/run-daily.sh
 ```bash
 FUDAN_CONTAINER_START_TIME=06:58:30
 FUDAN_OPEN_TIME=07:00:00
-FUDAN_PRE_OPEN_REFRESH_MS=1800
 FUDAN_SUBMIT_RESULT_TIMEOUT_MS=1500
 FUDAN_FORCE_LOGIN=true
 ```
