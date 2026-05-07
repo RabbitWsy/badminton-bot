@@ -214,6 +214,7 @@ class FudanBadmintonBot:
         self.page.goto(self.config.venue_url, wait_until="domcontentloaded")
         self.wait_network_idle(timeout_ms=10000)
         self.wait_for_direct_page_ready()
+        self.dismiss_reading_notice(timeout_ms=2000)
 
     def wait_for_direct_page_ready(self, *, timeout_ms: int = 8000) -> None:
         deadline = time.time() + timeout_ms / 1000
@@ -235,6 +236,7 @@ class FudanBadmintonBot:
         assert self.page is not None
         if self.is_logged_in():
             self.log("已处于登录状态。")
+            self.dismiss_reading_notice(timeout_ms=1000)
             return
 
         if not self.config.username or not self.config.password:
@@ -285,6 +287,7 @@ class FudanBadmintonBot:
         if not self.is_logged_in():
             raise BotError("登录后仍未检测到已登录状态。可能需要验证码、短信验证或页面结构已变化。")
         self.log("登录成功。")
+        self.dismiss_reading_notice(timeout_ms=1000)
 
     def is_logged_in(self) -> bool:
         assert self.page is not None
@@ -343,6 +346,7 @@ class FudanBadmintonBot:
 
             attempt += 1
             self.log(f"第 {attempt} 次检查 {self.target_date} 的可预约时段。")
+            self.dismiss_reading_notice(timeout_ms=100)
             try:
                 scope = self.ensure_target_date_visible()
             except BotError as exc:
@@ -353,6 +357,7 @@ class FudanBadmintonBot:
                 self.refresh_booking_page()
                 continue
             should_refresh_immediately = False
+            should_retry_immediately = False
             for slot in self.config.preferred_slots:
                 if len(booked) >= self.config.max_slots:
                     break
@@ -377,6 +382,13 @@ class FudanBadmintonBot:
                 elif status == "would-click":
                     self.log(f"[dry-run] 会尝试预约 {slot}，单元格文本: {text}")
                 elif status == "unavailable":
+                    if "阅读须知" in text:
+                        if self.dismiss_reading_notice(timeout_ms=500):
+                            self.log("检测到阅读须知弹窗，已确认后立即重试。")
+                            should_retry_immediately = True
+                            break
+                        self.log(f"{slot} 不可预约: 阅读须知弹窗未能自动确认。")
+                        continue
                     self.log(f"{slot} 不可预约: {text}")
                     if "未开放" in text and datetime.now(self.tz) >= self.today_open_datetime():
                         should_refresh_immediately = True
@@ -385,6 +397,8 @@ class FudanBadmintonBot:
                 elif status != "not-found":
                     self.log(f"{slot} 跳过: {status} {text}")
 
+            if should_retry_immediately:
+                continue
             if should_refresh_immediately:
                 self.refresh_booking_page()
                 continue
@@ -680,8 +694,94 @@ class FudanBadmintonBot:
             self.page.reload(wait_until="domcontentloaded")
             self.wait_network_idle(timeout_ms=10000)
             self.wait_for_direct_page_ready()
+            self.dismiss_reading_notice(timeout_ms=100)
         except PlaywrightTimeoutError:
             pass
+
+    def dismiss_reading_notice(self, *, timeout_ms: int = 500) -> bool:
+        assert self.page is not None
+        script = """
+        (labels) => {
+          const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+          const visible = (element) => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.visibility !== 'hidden' && style.display !== 'none'
+              && rect.width > 0 && rect.height > 0;
+          };
+          const isEnabled = (element) => !element.disabled && element.getAttribute('aria-disabled') !== 'true';
+          const buttonText = (element) => normalize(
+            element.innerText || element.value || element.getAttribute('aria-label') || element.textContent
+          );
+          const findConfirmButton = (container) => {
+            const buttons = Array.from(container.querySelectorAll(
+              'button, input[type="button"], input[type="submit"], a, [role="button"]'
+            )).filter((element) => visible(element) && isEnabled(element));
+            for (const label of labels) {
+              const target = buttons.find((element) => buttonText(element) === label);
+              if (target) return target;
+            }
+            return null;
+          };
+          const clickTarget = (target) => {
+            target.scrollIntoView({ block: 'center', inline: 'center' });
+            target.click();
+            return true;
+          };
+
+          const dialogSelectors = [
+            '.el-dialog',
+            '.el-message-box',
+            '.ant-modal',
+            '.van-dialog',
+            '.arco-modal',
+            '.ivu-modal',
+            '.layui-layer',
+            '.n-modal',
+            '.semi-modal',
+            '[role="dialog"]',
+            '.modal'
+          ];
+          const dialogs = Array.from(document.querySelectorAll(dialogSelectors.join(',')))
+            .filter((element) => visible(element))
+            .filter((element) => normalize(element.innerText || element.textContent).includes('阅读须知'));
+          for (const dialog of dialogs) {
+            const target = findConfirmButton(dialog);
+            if (target) return clickTarget(target);
+          }
+
+          const noticeElements = Array.from(document.querySelectorAll('body *'))
+            .filter((element) => visible(element))
+            .map((element) => ({ element, text: normalize(element.innerText || element.textContent) }))
+            .filter((item) => item.text.includes('阅读须知'))
+            .sort((a, b) => a.text.length - b.text.length);
+          for (const item of noticeElements) {
+            let container = item.element;
+            for (let depth = 0; depth < 10 && container && container !== document.body; depth += 1) {
+              const text = normalize(container.innerText || container.textContent);
+              if (text.includes('阅读须知')) {
+                const target = findConfirmButton(container);
+                if (target) return clickTarget(target);
+              }
+              container = container.parentElement;
+            }
+          }
+          return false;
+        }
+        """
+        deadline = time.time() + timeout_ms / 1000
+        labels = ["确定", "同意", "我知道了", "已阅读"]
+        while time.time() <= deadline:
+            for scope in self.scopes():
+                try:
+                    if scope.evaluate(script, labels):
+                        self.log("已确认阅读须知。")
+                        self.wait_network_idle(timeout_ms=1000)
+                        return True
+                except Exception:
+                    continue
+            time.sleep(0.05)
+        return False
 
     def wait_network_idle(self, *, timeout_ms: int) -> None:
         assert self.page is not None
