@@ -379,6 +379,10 @@ class FudanBadmintonBot:
                             scope = self.ensure_target_date_visible()
                     else:
                         self.log(f"{slot} 已点击但未确认成功，页面反馈: {text}")
+                        self.close_transient_overlays()
+                        self.reopen_venue_after_submit_failure()
+                        should_retry_immediately = True
+                        break
                 elif status == "would-click":
                     self.log(f"[dry-run] 会尝试预约 {slot}，单元格文本: {text}")
                 elif status == "unavailable":
@@ -388,6 +392,13 @@ class FudanBadmintonBot:
                             should_retry_immediately = True
                             break
                         self.log(f"{slot} 不可预约: 阅读须知弹窗未能自动确认。")
+                        continue
+                    if "已预约" in text:
+                        self.log(f"{slot} 已经处于预约状态，计入完成。")
+                        booked.append(slot)
+                        if len(booked) < self.config.max_slots:
+                            self.reopen_venue_after_success()
+                            scope = self.ensure_target_date_visible()
                         continue
                     self.log(f"{slot} 不可预约: {text}")
                     if "未开放" in text and datetime.now(self.tz) >= self.today_open_datetime():
@@ -417,6 +428,11 @@ class FudanBadmintonBot:
     def reopen_venue_after_success(self) -> None:
         assert self.page is not None
         self.log("预约成功后重新打开羽毛球场直达页，准备继续下一段。")
+        self.open_venue()
+
+    def reopen_venue_after_submit_failure(self) -> None:
+        assert self.page is not None
+        self.log("本次提交未成功，重新打开羽毛球场直达页以清空当前选择。")
         self.open_venue()
 
     def ensure_target_date_visible(self) -> Any:
@@ -468,7 +484,7 @@ class FudanBadmintonBot:
               if (!cell) return { status: 'missing-cell', text: '' };
 
               const text = normalize(cell.innerText);
-              const disabledText = /(未开放|已过期|已满|不可预约|停用|关闭|无余量|暂无|冲突)/;
+              const disabledText = /(未开放|已过期|已满|已预约|不可预约|停用|关闭|无余量|暂无|冲突)/;
               const disabledElement = cell.matches('[disabled], .disabled, .is-disabled, [aria-disabled="true"]')
                 || cell.querySelector('[disabled], .disabled, .is-disabled, [aria-disabled="true"]');
               if (disabledText.test(text) || disabledElement) {
@@ -513,7 +529,7 @@ class FudanBadmintonBot:
               }
             }
 
-            const disabledText = /(未开放|已过期|已满|约满|不可预约|停用|关闭|无余量|暂无|冲突)/;
+            const disabledText = /(未开放|已过期|已满|已预约|约满|不可预约|停用|关闭|无余量|暂无|冲突)/;
             if (disabledText.test(text)) {
               return { status: 'unavailable', text };
             }
@@ -533,14 +549,21 @@ class FudanBadmintonBot:
         if self.dry_run:
             return False
         assert self.page is not None
+        baseline_feedback = self.feedback_text()
         self.fill_phone_if_needed()
         clicked = self.click_submit_button()
         if not clicked:
+            success, feedback = self.wait_for_submit_result(slot, baseline_feedback=baseline_feedback, timeout_ms=800)
+            if success:
+                self.log(f"{slot} 预约成功。")
+                return True
+            if feedback:
+                self.log(f"{slot} 提交后未成功，页面反馈: {feedback[:160]}")
             self.log(f"{slot} 没有找到可点击的提交按钮。")
             return False
 
-        self.click_first_text(["确定", "确认", "我知道了"], required=False)
-        success, feedback = self.wait_for_submit_result(slot)
+        self.confirm_submit_if_needed()
+        success, feedback = self.wait_for_submit_result(slot, baseline_feedback=baseline_feedback)
         if success:
             self.log(f"{slot} 预约成功。")
             return True
@@ -548,25 +571,46 @@ class FudanBadmintonBot:
             self.log(f"{slot} 提交后未成功，页面反馈: {feedback[:160]}")
         return False
 
-    def wait_for_submit_result(self, slot: str) -> tuple[bool, str]:
-        timeout_ms = self.config.submit_result_timeout_ms
+    def wait_for_submit_result(
+        self,
+        slot: str,
+        *,
+        baseline_feedback: str = "",
+        timeout_ms: int | None = None,
+    ) -> tuple[bool, str]:
+        timeout_ms = timeout_ms or self.config.submit_result_timeout_ms
         deadline = time.time() + timeout_ms / 1000
         last_feedback = ""
         success_words = ["预约成功", "提交成功", "成功预约", "预约已提交"]
-        failure_words = ["失败", "错误", "约满", "已满", "不可预约", "未开放", "冲突", "重复", "超过"]
+        failure_words = [
+            "失败",
+            "错误",
+            "约满",
+            "已满",
+            "不可预约",
+            "未开放",
+            "冲突",
+            "重复",
+            "超过",
+            "剩余资源容量不足",
+            "最多预约1个时段",
+        ]
 
         while time.time() <= deadline:
             feedback = self.feedback_text()
-            if feedback:
-                last_feedback = feedback
-                if any(word in feedback for word in success_words):
-                    return True, feedback
-                if any(word in feedback for word in failure_words):
-                    return False, feedback
+            new_feedback = self.feedback_without_baseline(feedback, baseline_feedback)
+            if new_feedback:
+                last_feedback = new_feedback
+                if any(word in new_feedback for word in success_words):
+                    return True, new_feedback
+                if any(word in new_feedback for word in failure_words):
+                    return False, new_feedback
+
+            slot_text = self.slot_cell_text(slot)
+            if "已预约" in slot_text:
+                return True, f"目标时段已变为已预约: {slot_text}"
 
             body_text = self.current_text(timeout_ms=300)
-            if any(word in body_text for word in success_words):
-                return True, feedback or "检测到成功提示"
             if (
                 "我的预约" in body_text
                 and self.target_date in body_text
@@ -577,6 +621,56 @@ class FudanBadmintonBot:
             time.sleep(0.1)
 
         return False, last_feedback
+
+    def feedback_without_baseline(self, feedback: str, baseline_feedback: str) -> str:
+        if not feedback:
+            return ""
+        if not baseline_feedback:
+            return feedback
+        chunks = [chunk.strip() for chunk in feedback.split(" | ") if chunk.strip()]
+        new_chunks = [chunk for chunk in chunks if chunk not in baseline_feedback]
+        return " | ".join(new_chunks)
+
+    def slot_cell_text(self, slot: str) -> str:
+        assert self.page is not None
+        script = """
+        ({ dateText, slotText }) => {
+          const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+          const tables = Array.from(document.querySelectorAll('table'));
+          for (const table of tables) {
+            const rows = Array.from(table.querySelectorAll('tr'));
+            let headerRowIndex = -1;
+            let colIndex = -1;
+            for (let rowIndex = 0; rowIndex < Math.min(rows.length, 6); rowIndex += 1) {
+              const cells = Array.from(rows[rowIndex].children);
+              for (let index = 0; index < cells.length; index += 1) {
+                if (normalize(cells[index].innerText).includes(dateText)) {
+                  headerRowIndex = rowIndex;
+                  colIndex = index;
+                  break;
+                }
+              }
+              if (colIndex >= 0) break;
+            }
+            if (colIndex < 0) continue;
+            for (let rowIndex = headerRowIndex + 1; rowIndex < rows.length; rowIndex += 1) {
+              const cells = Array.from(rows[rowIndex].children);
+              if (!cells.length) continue;
+              if (!normalize(cells[0].innerText).includes(slotText)) continue;
+              return normalize((cells[colIndex] && cells[colIndex].innerText) || '');
+            }
+          }
+          return '';
+        }
+        """
+        for scope in self.scopes():
+            try:
+                text = scope.evaluate(script, {"dateText": self.target_date, "slotText": slot})
+            except Exception:
+                continue
+            if text:
+                return text
+        return ""
 
     def feedback_text(self) -> str:
         script = """
@@ -595,6 +689,11 @@ class FudanBadmintonBot:
             '.ant-message',
             '.ant-notification',
             '.ant-modal',
+            '.el-popover',
+            '.el-tooltip__popper',
+            '.ant-popover',
+            '.popover',
+            '.tooltip',
             '[role="alert"]',
             '[role="dialog"]',
             '.toast',
@@ -621,6 +720,66 @@ class FudanBadmintonBot:
             if text:
                 chunks.append(text)
         return " | ".join(chunks)
+
+    def confirm_submit_if_needed(self, *, timeout_ms: int = 1000) -> bool:
+        assert self.page is not None
+        script = """
+        (labels) => {
+          const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+          const visible = (element) => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.visibility !== 'hidden' && style.display !== 'none'
+              && rect.width > 0 && rect.height > 0;
+          };
+          const clickableSelector = 'button, input[type="button"], input[type="submit"], a, [role="button"]';
+          const buttonText = (element) => normalize(
+            element.innerText || element.value || element.getAttribute('aria-label') || element.textContent
+          );
+          const findButton = (container) => Array.from(container.querySelectorAll(clickableSelector))
+            .filter((element) => visible(element) && !element.disabled && element.getAttribute('aria-disabled') !== 'true')
+            .find((element) => labels.includes(buttonText(element)));
+
+          const dialogSelectors = [
+            '.el-dialog',
+            '.el-message-box',
+            '.ant-modal',
+            '.van-dialog',
+            '[role="dialog"]',
+            '.modal'
+          ];
+          for (const dialog of Array.from(document.querySelectorAll(dialogSelectors.join(','))).filter(visible)) {
+            const target = findButton(dialog);
+            if (target) {
+              target.scrollIntoView({ block: 'center', inline: 'center' });
+              target.click();
+              return true;
+            }
+          }
+
+          const target = Array.from(document.querySelectorAll(clickableSelector))
+            .filter((element) => visible(element) && !element.disabled && element.getAttribute('aria-disabled') !== 'true')
+            .find((element) => labels.includes(buttonText(element)));
+          if (target) {
+            target.scrollIntoView({ block: 'center', inline: 'center' });
+            target.click();
+            return true;
+          }
+          return false;
+        }
+        """
+        deadline = time.time() + timeout_ms / 1000
+        labels = ["确定", "确认", "我知道了"]
+        while time.time() <= deadline:
+            for scope in self.scopes():
+                try:
+                    if scope.evaluate(script, labels):
+                        self.wait_network_idle(timeout_ms=1000)
+                        return True
+                except Exception:
+                    continue
+            time.sleep(0.05)
+        return False
 
     def fill_phone_if_needed(self) -> None:
         if not self.config.phone:
@@ -674,10 +833,8 @@ class FudanBadmintonBot:
             {"text": "确认预约", "exact": False},
             {"text": "立即预约", "exact": False},
             {"text": "提交", "exact": True},
-            {"text": "确定", "exact": True},
-            {"text": "预约", "exact": True},
         ]
-        deadline = time.time() + 0.6
+        deadline = time.time() + 1.0
         while time.time() <= deadline:
             for scope in self.scopes():
                 try:
@@ -687,6 +844,14 @@ class FudanBadmintonBot:
                     continue
             time.sleep(0.05)
         return False
+
+    def close_transient_overlays(self) -> None:
+        assert self.page is not None
+        try:
+            self.page.keyboard.press("Escape")
+            self.wait_network_idle(timeout_ms=300)
+        except Exception:
+            pass
 
     def refresh_booking_page(self) -> None:
         assert self.page is not None
