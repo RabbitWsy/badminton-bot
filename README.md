@@ -19,6 +19,7 @@ https://booking.fudan.edu.cn/reservation/fe/site/reservationInfo?id=1055
 - 数量：最多 3 个时段；每次只提交 1 个时段，成功后重新打开预约页再继续下一段。
 - 执行方式：容器常驻进程默认每天 `06:58:30` 启动一次任务，提前登录并进入预约页，等到 `07:00:00` 后刷新预约页并开始点击。
 - 页面弹出「阅读须知」时，会先点击「确定」再继续预约。
+- 点击时段格子后出现的「已预约/点击查看详情」浮层不会被当作成功；只有跳转后的预约记录里出现目标日期、目标时段、「已预约」和「待签到」才算预约成功。
 
 ## 容器部署
 
@@ -59,7 +60,7 @@ bash scripts/run-daily.sh
 ```bash
 FUDAN_CONTAINER_START_TIME=06:58:30
 FUDAN_OPEN_TIME=07:00:00
-FUDAN_SUBMIT_RESULT_TIMEOUT_MS=1500
+FUDAN_SUBMIT_RESULT_TIMEOUT_MS=2000
 FUDAN_FORCE_LOGIN=true
 ```
 

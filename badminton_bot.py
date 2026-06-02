@@ -110,7 +110,7 @@ def load_config(env_file: Path) -> Config:
         retry_until_seconds=float(os.getenv("FUDAN_RETRY_UNTIL_SECONDS", "45")),
         retry_interval_seconds=float(os.getenv("FUDAN_RETRY_INTERVAL_SECONDS", "0.5")),
         page_settle_timeout_ms=int(os.getenv("FUDAN_PAGE_SETTLE_TIMEOUT_MS", "1200")),
-        submit_result_timeout_ms=int(os.getenv("FUDAN_SUBMIT_RESULT_TIMEOUT_MS", "1500")),
+        submit_result_timeout_ms=int(os.getenv("FUDAN_SUBMIT_RESULT_TIMEOUT_MS", "3500")),
         force_login=parse_bool(os.getenv("FUDAN_FORCE_LOGIN"), True),
         headless=parse_bool(os.getenv("FUDAN_HEADLESS"), True),
         slow_mo_ms=int(os.getenv("FUDAN_SLOW_MO_MS", "0")),
@@ -381,8 +381,8 @@ class FudanBadmintonBot:
                         self.log(f"{slot} 已点击但未确认成功，页面反馈: {text}")
                         self.close_transient_overlays()
                         self.reopen_venue_after_submit_failure()
-                        should_retry_immediately = True
-                        break
+                        scope = self.ensure_target_date_visible()
+                        continue
                 elif status == "would-click":
                     self.log(f"[dry-run] 会尝试预约 {slot}，单元格文本: {text}")
                 elif status == "unavailable":
@@ -392,13 +392,6 @@ class FudanBadmintonBot:
                             should_retry_immediately = True
                             break
                         self.log(f"{slot} 不可预约: 阅读须知弹窗未能自动确认。")
-                        continue
-                    if "已预约" in text:
-                        self.log(f"{slot} 已经处于预约状态，计入完成。")
-                        booked.append(slot)
-                        if len(booked) < self.config.max_slots:
-                            self.reopen_venue_after_success()
-                            scope = self.ensure_target_date_visible()
                         continue
                     self.log(f"{slot} 不可预约: {text}")
                     if "未开放" in text and datetime.now(self.tz) >= self.today_open_datetime():
@@ -581,7 +574,6 @@ class FudanBadmintonBot:
         timeout_ms = timeout_ms or self.config.submit_result_timeout_ms
         deadline = time.time() + timeout_ms / 1000
         last_feedback = ""
-        success_words = ["预约成功", "提交成功", "成功预约", "预约已提交"]
         failure_words = [
             "失败",
             "错误",
@@ -601,23 +593,12 @@ class FudanBadmintonBot:
             new_feedback = self.feedback_without_baseline(feedback, baseline_feedback)
             if new_feedback:
                 last_feedback = new_feedback
-                if any(word in new_feedback for word in success_words):
-                    return True, new_feedback
                 if any(word in new_feedback for word in failure_words):
                     return False, new_feedback
 
-            slot_text = self.slot_cell_text(slot)
-            if "已预约" in slot_text:
-                return True, f"目标时段已变为已预约: {slot_text}"
-
-            body_text = self.current_text(timeout_ms=300)
-            if (
-                "我的预约" in body_text
-                and self.target_date in body_text
-                and slot in body_text
-                and any(word in body_text for word in ["已预约", "待签到"])
-            ):
-                return True, "检测到我的预约记录"
+            record_text = self.confirmed_appointment_record_text(slot)
+            if record_text:
+                return True, f"检测到待签到预约记录: {record_text}"
             time.sleep(0.1)
 
         return False, last_feedback
@@ -631,34 +612,39 @@ class FudanBadmintonBot:
         new_chunks = [chunk for chunk in chunks if chunk not in baseline_feedback]
         return " | ".join(new_chunks)
 
-    def slot_cell_text(self, slot: str) -> str:
+    def confirmed_appointment_record_text(self, slot: str) -> str:
         assert self.page is not None
         script = """
         ({ dateText, slotText }) => {
           const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim();
-          const tables = Array.from(document.querySelectorAll('table'));
-          for (const table of tables) {
-            const rows = Array.from(table.querySelectorAll('tr'));
-            let headerRowIndex = -1;
-            let colIndex = -1;
-            for (let rowIndex = 0; rowIndex < Math.min(rows.length, 6); rowIndex += 1) {
-              const cells = Array.from(rows[rowIndex].children);
-              for (let index = 0; index < cells.length; index += 1) {
-                if (normalize(cells[index].innerText).includes(dateText)) {
-                  headerRowIndex = rowIndex;
-                  colIndex = index;
-                  break;
-                }
-              }
-              if (colIndex >= 0) break;
-            }
-            if (colIndex < 0) continue;
-            for (let rowIndex = headerRowIndex + 1; rowIndex < rows.length; rowIndex += 1) {
-              const cells = Array.from(rows[rowIndex].children);
-              if (!cells.length) continue;
-              if (!normalize(cells[0].innerText).includes(slotText)) continue;
-              return normalize((cells[colIndex] && cells[colIndex].innerText) || '');
-            }
+          const visible = (element) => {
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.visibility !== 'hidden' && style.display !== 'none'
+              && rect.width > 0 && rect.height > 0;
+          };
+          const selectors = [
+            'tr',
+            '.el-table__row',
+            '.ant-table-row',
+            '.van-cell',
+            '.list-item',
+            'li',
+            '[class*="reservation"]',
+            '[class*="order"]',
+            '[class*="record"]',
+            '[class*="item"]'
+          ];
+          const candidates = Array.from(document.querySelectorAll(selectors.join(',')))
+            .filter((element) => visible(element))
+            .map((element) => normalize(element.innerText || element.textContent))
+            .filter((text) => text.includes(dateText)
+              && text.includes(slotText)
+              && text.includes('待签到')
+              && text.includes('已预约'))
+            .sort((a, b) => a.length - b.length);
+          for (const text of candidates) {
+            if (text.length <= 1200) return text;
           }
           return '';
         }
@@ -689,11 +675,6 @@ class FudanBadmintonBot:
             '.ant-message',
             '.ant-notification',
             '.ant-modal',
-            '.el-popover',
-            '.el-tooltip__popper',
-            '.ant-popover',
-            '.popover',
-            '.tooltip',
             '[role="alert"]',
             '[role="dialog"]',
             '.toast',
