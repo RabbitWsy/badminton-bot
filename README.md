@@ -39,13 +39,18 @@ FUDAN_PASSWORD=你的密码
 FUDAN_PHONE=你的手机号
 ```
 
-如果容器里是 root，安装脚本会尝试执行：
+安装脚本默认会安装 Python 依赖、Playwright Chromium、Chromium 系统依赖和 `xvfb`。其中系统依赖需要管理员权限：
+
+- root 用户会直接安装。
+- 非 root 用户会通过 `sudo` 安装，并在终端提示输入当前用户密码。
+
+如果容器镜像已经内置 Chromium 系统依赖和 `xvfb`，可以跳过系统依赖安装：
 
 ```bash
-python -m playwright install --with-deps chromium
+PLAYWRIGHT_INSTALL_DEPS=false bash scripts/install-container.sh
 ```
 
-如果不是 root，只会安装 Playwright 浏览器；缺系统库时需要让容器镜像提前安装 Chromium 依赖，或用带 Playwright 依赖的基础镜像。
+非 Debian/Ubuntu 系镜像如果没有 `apt-get`，脚本无法自动安装 `xvfb`，需要在镜像里提前安装，或提供可用的 `DISPLAY`。
 
 ## 每天自动运行
 

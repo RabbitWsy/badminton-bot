@@ -5,6 +5,45 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+PLAYWRIGHT_INSTALL_DEPS="${PLAYWRIGHT_INSTALL_DEPS:-auto}"
+
+case "$PLAYWRIGHT_INSTALL_DEPS" in
+  auto|true|false) ;;
+  *)
+    echo "PLAYWRIGHT_INSTALL_DEPS 只能是 auto、true 或 false，当前值: $PLAYWRIGHT_INSTALL_DEPS"
+    exit 2
+    ;;
+esac
+
+run_as_root() {
+  if [ "$(id -u)" -eq 0 ]; then
+    "$@"
+    return
+  fi
+
+  if ! command -v sudo >/dev/null 2>&1; then
+    echo "需要安装系统依赖，但当前用户不是 root，且未找到 sudo。"
+    echo "请用 root 运行本脚本、安装 sudo，或设置 PLAYWRIGHT_INSTALL_DEPS=false 跳过系统依赖。"
+    exit 2
+  fi
+
+  sudo "$@"
+}
+
+ensure_root_access() {
+  if [ "$(id -u)" -eq 0 ]; then
+    return
+  fi
+
+  if ! command -v sudo >/dev/null 2>&1; then
+    echo "需要安装系统依赖，但当前用户不是 root，且未找到 sudo。"
+    echo "请用 root 运行本脚本、安装 sudo，或设置 PLAYWRIGHT_INSTALL_DEPS=false 跳过系统依赖。"
+    exit 2
+  fi
+
+  echo "即将通过 sudo 安装 Chromium 系统依赖和 xvfb，可能会提示输入当前用户密码。"
+  sudo -v
+}
 
 if [ ! -f ".env" ]; then
   cp .env.example .env
@@ -31,13 +70,16 @@ fi
 .venv/bin/python -m pip install --upgrade pip
 .venv/bin/pip install -r requirements.txt
 
-if [ "${PLAYWRIGHT_INSTALL_DEPS:-auto}" = "true" ] || {
-  [ "${PLAYWRIGHT_INSTALL_DEPS:-auto}" = "auto" ] && [ "$(id -u)" -eq 0 ];
-}; then
-  .venv/bin/python -m playwright install --with-deps chromium
+if [ "$PLAYWRIGHT_INSTALL_DEPS" = "true" ] || [ "$PLAYWRIGHT_INSTALL_DEPS" = "auto" ]; then
+  ensure_root_access
+  run_as_root .venv/bin/python -m playwright install-deps chromium
+  .venv/bin/python -m playwright install chromium
   if command -v apt-get >/dev/null 2>&1; then
-    apt-get update
-    apt-get install -y xvfb
+    run_as_root apt-get update
+    run_as_root apt-get install -y xvfb
+  elif ! command -v xvfb-run >/dev/null 2>&1; then
+    echo "未找到 apt-get，无法自动安装 xvfb。请手动安装 xvfb，或提供 DISPLAY。"
+    exit 2
   fi
 else
   .venv/bin/python -m playwright install chromium
