@@ -35,10 +35,14 @@ if [ "${PLAYWRIGHT_INSTALL_DEPS:-auto}" = "true" ] || {
   [ "${PLAYWRIGHT_INSTALL_DEPS:-auto}" = "auto" ] && [ "$(id -u)" -eq 0 ];
 }; then
   .venv/bin/python -m playwright install --with-deps chromium
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update
+    apt-get install -y xvfb
+  fi
 else
   .venv/bin/python -m playwright install chromium
 fi
 
 echo "容器依赖安装完成。"
-echo "测试运行：FUDAN_WAIT_UNTIL_OPEN=false .venv/bin/python badminton_bot.py --dry-run"
+echo "测试运行：FUDAN_WAIT_UNTIL_OPEN=false bash scripts/run-once.sh --dry-run"
 echo "每日前台循环：bash scripts/run-daily.sh"

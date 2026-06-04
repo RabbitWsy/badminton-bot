@@ -3,5 +3,5 @@
 __pycache__/
 *.pyc
 logs/
-storage_state.json
 .DS_Store
+storage_state.json

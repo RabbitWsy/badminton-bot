@@ -3,7 +3,11 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shutil
+import socket
+import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -47,12 +51,11 @@ class Config:
     retry_interval_seconds: float
     page_settle_timeout_ms: int
     submit_result_timeout_ms: int
-    force_login: bool
     headless: bool
+    use_cdp_browser: bool
     slow_mo_ms: int
     browser_channel: str
     browser_executable_path: str
-    storage_state: Path
     log_dir: Path
     navigation_timeout_ms: int = 30000
     action_timeout_ms: int = 5000
@@ -110,13 +113,15 @@ def load_config(env_file: Path) -> Config:
         retry_until_seconds=float(os.getenv("FUDAN_RETRY_UNTIL_SECONDS", "45")),
         retry_interval_seconds=float(os.getenv("FUDAN_RETRY_INTERVAL_SECONDS", "0.5")),
         page_settle_timeout_ms=int(os.getenv("FUDAN_PAGE_SETTLE_TIMEOUT_MS", "1200")),
-        submit_result_timeout_ms=int(os.getenv("FUDAN_SUBMIT_RESULT_TIMEOUT_MS", "3500")),
-        force_login=parse_bool(os.getenv("FUDAN_FORCE_LOGIN"), True),
-        headless=parse_bool(os.getenv("FUDAN_HEADLESS"), True),
+        submit_result_timeout_ms=int(os.getenv("FUDAN_SUBMIT_RESULT_TIMEOUT_MS", "2000")),
+        headless=parse_bool(os.getenv("FUDAN_HEADLESS"), False),
+        use_cdp_browser=parse_bool(
+            os.getenv("FUDAN_USE_CDP_BROWSER"),
+            not parse_bool(os.getenv("FUDAN_HEADLESS"), False),
+        ),
         slow_mo_ms=int(os.getenv("FUDAN_SLOW_MO_MS", "0")),
         browser_channel=os.getenv("FUDAN_BROWSER_CHANNEL", "").strip(),
         browser_executable_path=os.getenv("FUDAN_BROWSER_EXECUTABLE_PATH", "").strip(),
-        storage_state=root / os.getenv("FUDAN_STORAGE_STATE", "storage_state.json"),
         log_dir=root / os.getenv("FUDAN_LOG_DIR", "logs"),
     )
 
@@ -134,36 +139,38 @@ class FudanBadmintonBot:
 
     def run_once(self, *, login_only: bool = False) -> int:
         with sync_playwright() as playwright:
-            launch_kwargs: dict[str, Any] = {
-                "headless": self.config.headless,
-                "slow_mo": self.config.slow_mo_ms,
-            }
-            if self.config.browser_channel:
-                launch_kwargs["channel"] = self.config.browser_channel
-            if self.config.browser_executable_path:
-                launch_kwargs["executable_path"] = self.config.browser_executable_path
-            browser = playwright.chromium.launch(**launch_kwargs)
             context_kwargs: dict[str, Any] = {
                 "viewport": {"width": 1440, "height": 1100},
                 "locale": "zh-CN",
                 "timezone_id": self.config.timezone,
             }
-            if self.config.storage_state.exists() and not self.config.force_login:
-                context_kwargs["storage_state"] = str(self.config.storage_state)
-
-            context = browser.new_context(**context_kwargs)
+            browser_process: subprocess.Popen[Any] | None = None
+            profile_dir: tempfile.TemporaryDirectory[str] | None = None
+            if self.config.use_cdp_browser and not self.config.headless:
+                browser, context, browser_process, profile_dir = self.launch_external_cdp_browser(
+                    playwright,
+                    context_kwargs,
+                )
+            else:
+                launch_kwargs: dict[str, Any] = {
+                    "headless": self.config.headless,
+                    "slow_mo": self.config.slow_mo_ms,
+                }
+                if self.config.browser_channel:
+                    launch_kwargs["channel"] = self.config.browser_channel
+                if self.config.browser_executable_path:
+                    launch_kwargs["executable_path"] = self.config.browser_executable_path
+                browser = playwright.chromium.launch(**launch_kwargs)
+                context = browser.new_context(**context_kwargs)
             context.set_default_timeout(self.config.action_timeout_ms)
             context.set_default_navigation_timeout(self.config.navigation_timeout_ms)
             self.page = context.new_page()
 
             try:
-                if self.config.force_login:
-                    self.log("本次运行强制重新登录，不使用旧 storage_state 启动。")
                 self.open_venue()
                 self.login_if_needed()
-                context.storage_state(path=str(self.config.storage_state))
                 if login_only:
-                    self.log("登录态已保存。")
+                    self.log("登录流程完成。")
                     return 0
 
                 if not self.is_booking_page():
@@ -192,6 +199,84 @@ class FudanBadmintonBot:
             finally:
                 context.close()
                 browser.close()
+                if browser_process:
+                    browser_process.terminate()
+                    try:
+                        browser_process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        browser_process.kill()
+                if profile_dir:
+                    profile_dir.cleanup()
+
+    def launch_external_cdp_browser(
+        self,
+        playwright: Any,
+        context_kwargs: dict[str, Any],
+    ) -> tuple[Any, Any, subprocess.Popen[Any], tempfile.TemporaryDirectory[str]]:
+        executable = self.find_browser_executable(playwright)
+        profile_dir = tempfile.TemporaryDirectory(prefix="fudan-booking-profile-")
+        port = self.free_port()
+        args = [
+            executable,
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={profile_dir.name}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-dev-shm-usage",
+            "--window-size=1440,1100",
+            "about:blank",
+        ]
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            args.append("--no-sandbox")
+        process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        endpoint = f"http://127.0.0.1:{port}"
+        deadline = time.time() + 10
+        last_error: Exception | None = None
+        while time.time() < deadline:
+            try:
+                browser = playwright.chromium.connect_over_cdp(endpoint)
+                try:
+                    context = browser.new_context(**context_kwargs)
+                except Exception:
+                    context = browser.contexts[0] if browser.contexts else browser.new_context()
+                self.log(f"已通过外部浏览器连接: {executable}")
+                return browser, context, process, profile_dir
+            except Exception as exc:
+                last_error = exc
+                time.sleep(0.2)
+        process.terminate()
+        profile_dir.cleanup()
+        raise BotError(f"无法连接外部浏览器 CDP: {last_error}")
+
+    def find_browser_executable(self, playwright: Any) -> str:
+        if self.config.browser_executable_path:
+            return self.config.browser_executable_path
+
+        candidates: list[str] = []
+        if sys.platform == "darwin":
+            candidates.extend([
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                str(Path.home() / "Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            ])
+        candidates.extend([
+            "google-chrome",
+            "google-chrome-stable",
+            "chromium",
+            "chromium-browser",
+        ])
+
+        for candidate in candidates:
+            if "/" in candidate and Path(candidate).exists():
+                return candidate
+            resolved = shutil.which(candidate)
+            if resolved:
+                return resolved
+        return playwright.chromium.executable_path
+
+    def free_port(self) -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return int(sock.getsockname()[1])
 
     def log(self, message: str) -> None:
         stamp = datetime.now(self.tz).strftime("%Y-%m-%d %H:%M:%S")
@@ -261,14 +346,14 @@ class FudanBadmintonBot:
         ]
         if not self.first_visible_locator(password_selectors):
             self.log("尝试打开账号密码登录页。")
-            self.click_first_text(["登录", "统一身份认证", "账号登录", "密码登录", "用户名密码登录"], required=False)
+            self.click_first_text(["Sign in", "登录", "统一身份认证", "账号登录", "密码登录", "用户名密码登录"], required=False)
             self.wait_network_idle(timeout_ms=10000)
 
         self.log("尝试使用账号密码登录。")
         username_input = self.first_visible_locator_with_timeout(username_selectors, timeout_ms=10000)
         password_input = self.first_visible_locator_with_timeout(password_selectors, timeout_ms=10000)
         if not username_input or not password_input:
-            raise BotError("没有找到账号密码输入框。若页面要求验证码或扫码，请手动登录后保存 storage_state。")
+            raise BotError("没有找到账号密码输入框。若页面为空白，通常是站点风控拦截了 headless 浏览器。")
 
         username_input.fill(self.config.username)
         password_input.fill(self.config.password)
@@ -1026,7 +1111,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--env-file", default=".env", help="环境变量文件路径")
     parser.add_argument("--target-date", help="指定预约日期，格式 YYYY-MM-DD；默认今天 + FUDAN_TARGET_DAYS_AHEAD")
     parser.add_argument("--dry-run", action="store_true", help="只检查并打印会点击的时段，不提交预约")
-    parser.add_argument("--login-only", action="store_true", help="只登录并保存 storage_state.json")
+    parser.add_argument("--login-only", action="store_true", help="只登录并进入预约页，不提交预约")
     parser.add_argument("--headed", action="store_true", help="显示浏览器窗口，覆盖 FUDAN_HEADLESS")
     return parser.parse_args(argv)
 
@@ -1035,7 +1120,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv or sys.argv[1:])
     config = load_config(Path(args.env_file))
     if args.headed:
-        config = Config(**{**config.__dict__, "headless": False})
+        config = Config(**{**config.__dict__, "headless": False, "use_cdp_browser": True})
 
     bot = FudanBadmintonBot(config, dry_run=args.dry_run, target_date=args.target_date)
     return bot.run_once(login_only=args.login_only)

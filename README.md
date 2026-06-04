@@ -8,7 +8,7 @@
 https://booking.fudan.edu.cn/reservation/fe/site/reservationInfo?id=1055
 ```
 
-有 cookie 时会直接显示预约时段；没有 cookie 时会跳到用户名密码认证页面。
+未登录时会跳到用户名密码认证页面；脚本每天运行时都会重新登录。
 
 ## 当前策略
 
@@ -55,13 +55,14 @@ python -m playwright install --with-deps chromium
 bash scripts/run-daily.sh
 ```
 
-这个脚本会读取 `.env`，默认每天 `06:58:30` 运行一次 `badminton_bot.py`。可以在 `.env` 里调整：
+这个脚本会读取 `.env`，默认每天 `06:58:30` 运行一次 `badminton_bot.py`。`booking.fudan.edu.cn` 目前会拦截 headless 浏览器，所以默认使用 headed Chrome；容器没有 `DISPLAY` 时，`run-daily.sh` 会自动通过 `xvfb-run` 提供虚拟显示。可以在 `.env` 里调整：
 
 ```bash
 FUDAN_CONTAINER_START_TIME=06:58:30
 FUDAN_OPEN_TIME=07:00:00
 FUDAN_SUBMIT_RESULT_TIMEOUT_MS=2000
-FUDAN_FORCE_LOGIN=true
+FUDAN_HEADLESS=false
+FUDAN_USE_CDP_BROWSER=true
 ```
 
 实际部署时，让容器的主进程执行 `bash scripts/run-daily.sh`，或者在 `tmux`/`screen`/`nohup` 中运行它。
@@ -71,25 +72,25 @@ FUDAN_FORCE_LOGIN=true
 不提交预约，只验证登录、进入预约页、定位日期和时段：
 
 ```bash
-FUDAN_WAIT_UNTIL_OPEN=false .venv/bin/python badminton_bot.py --dry-run
+FUDAN_WAIT_UNTIL_OPEN=false bash scripts/run-once.sh --dry-run
 ```
 
-只登录并保存 cookie：
+只登录并进入预约页：
 
 ```bash
-.venv/bin/python badminton_bot.py --login-only
+bash scripts/run-once.sh --login-only
 ```
 
 指定日期测试：
 
 ```bash
-FUDAN_WAIT_UNTIL_OPEN=false .venv/bin/python badminton_bot.py --target-date 2026-04-29 --dry-run
+FUDAN_WAIT_UNTIL_OPEN=false bash scripts/run-once.sh --target-date 2026-04-29 --dry-run
 ```
 
-本地 Mac 如果 Playwright Chromium 下载失败，但系统已经安装 Google Chrome，可以临时这样测试：
+本地 Mac 默认会启动系统 Chrome 并通过 CDP 连接控制。也可以显式指定：
 
 ```bash
-FUDAN_BROWSER_CHANNEL=chrome FUDAN_WAIT_UNTIL_OPEN=false .venv/bin/python badminton_bot.py --dry-run
+FUDAN_USE_CDP_BROWSER=true FUDAN_WAIT_UNTIL_OPEN=false bash scripts/run-once.sh --dry-run
 ```
 
 ## 配置
@@ -106,13 +107,13 @@ FUDAN_PREFERRED_SLOTS=21:00-22:30,20:00-21:00,19:00-20:00,18:00-19:00,17:00-18:0
 
 预约成功后，脚本会重新打开 `FUDAN_VENUE_URL`，继续尝试下一个时段。
 
-默认 `FUDAN_FORCE_LOGIN=true`，每天运行都会忽略旧 `storage_state.json` 先重新登录一次，并在登录成功后覆盖写入新的 `storage_state.json`。这样学校 cookie 两天失效也不会影响当天运行；同一轮抢场里的刷新仍然使用当前浏览器会话。
+脚本不再加载或保存 `storage_state.json`，每次运行都会重新登录；同一轮抢场里的刷新仍然使用当前浏览器会话。
 
 ## 项目文件
 
 - `badminton_bot.py`：预约脚本。
 - `.env.example`：配置模板，真实账号密码放在 `.env`。
 - `scripts/install-container.sh`：容器内安装依赖。
+- `scripts/run-once.sh`：单次运行，会在无 `DISPLAY` 且 `FUDAN_HEADLESS=false` 时自动使用 `xvfb-run`。
 - `scripts/run-daily.sh`：无 systemd 环境下的每日前台循环。
 - `logs/`：运行截图和失败截图。
-- `storage_state.json`：登录态缓存。

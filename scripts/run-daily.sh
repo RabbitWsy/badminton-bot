@@ -9,6 +9,33 @@ if [ ! -x ".venv/bin/python" ]; then
   exit 2
 fi
 
+run_bot() {
+  local use_xvfb
+  use_xvfb="$(
+    .venv/bin/python - <<'PY'
+import os
+import sys
+
+from dotenv import load_dotenv
+
+load_dotenv(".env")
+headless = os.getenv("FUDAN_HEADLESS", "false").strip().lower()
+needs_display = sys.platform.startswith("linux") and not os.getenv("DISPLAY")
+print("1" if headless in {"0", "false", "no", "off"} and needs_display else "0")
+PY
+  )"
+
+  if [ "$use_xvfb" = "1" ]; then
+    if ! command -v xvfb-run >/dev/null 2>&1; then
+      echo "FUDAN_HEADLESS=false 且当前没有 DISPLAY，但未找到 xvfb-run。请安装 xvfb 后再运行。"
+      return 2
+    fi
+    xvfb-run -a -s "-screen 0 1440x1100x24" .venv/bin/python badminton_bot.py
+  else
+    .venv/bin/python badminton_bot.py
+  fi
+}
+
 while true; do
   next_run="$(
     .venv/bin/python - <<'PY'
@@ -41,7 +68,7 @@ PY
   fi
 
   echo "开始运行：$(date '+%Y-%m-%d %H:%M:%S %Z')"
-  if ! .venv/bin/python badminton_bot.py; then
+  if ! run_bot; then
     echo "本次运行失败，等待下一轮。"
   fi
   sleep 60
