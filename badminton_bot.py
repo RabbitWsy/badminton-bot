@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -200,13 +202,9 @@ class FudanBadmintonBot:
                 context.close()
                 browser.close()
                 if browser_process:
-                    browser_process.terminate()
-                    try:
-                        browser_process.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        browser_process.kill()
+                    self.terminate_browser_process(browser_process)
                 if profile_dir:
-                    profile_dir.cleanup()
+                    self.cleanup_profile_dir(profile_dir)
 
     def launch_external_cdp_browser(
         self,
@@ -230,23 +228,63 @@ class FudanBadmintonBot:
             args.append("--no-sandbox")
         process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         endpoint = f"http://127.0.0.1:{port}"
-        deadline = time.time() + 10
-        last_error: Exception | None = None
-        while time.time() < deadline:
+        try:
+            ws_endpoint = self.wait_for_cdp_websocket(endpoint, process=process, timeout_seconds=10)
+            browser = playwright.chromium.connect_over_cdp(ws_endpoint, timeout=10000)
             try:
-                browser = playwright.chromium.connect_over_cdp(endpoint)
-                try:
-                    context = browser.new_context(**context_kwargs)
-                except Exception:
-                    context = browser.contexts[0] if browser.contexts else browser.new_context()
-                self.log(f"已通过外部浏览器连接: {executable}")
-                return browser, context, process, profile_dir
+                context = browser.new_context(**context_kwargs)
+            except Exception:
+                context = browser.contexts[0] if browser.contexts else browser.new_context()
+            self.log(f"已通过外部浏览器连接: {executable}")
+            return browser, context, process, profile_dir
+        except Exception:
+            self.terminate_browser_process(process)
+            self.cleanup_profile_dir(profile_dir)
+            raise
+
+    def wait_for_cdp_websocket(
+        self,
+        endpoint: str,
+        *,
+        process: subprocess.Popen[Any],
+        timeout_seconds: float,
+    ) -> str:
+        deadline = time.time() + timeout_seconds
+        version_url = f"{endpoint}/json/version"
+        last_error: Exception | str | None = None
+        while time.time() < deadline:
+            if process.poll() is not None:
+                raise BotError(f"外部浏览器提前退出，退出码: {process.returncode}")
+            try:
+                with urllib.request.urlopen(version_url, timeout=0.5) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                ws_endpoint = payload.get("webSocketDebuggerUrl")
+                if isinstance(ws_endpoint, str) and ws_endpoint.startswith("ws"):
+                    return ws_endpoint
+                last_error = "DevTools JSON 中没有 webSocketDebuggerUrl"
             except Exception as exc:
                 last_error = exc
-                time.sleep(0.2)
+            time.sleep(0.2)
+        raise BotError(f"等待外部浏览器 CDP 端点超时: {last_error}")
+
+    def terminate_browser_process(self, process: subprocess.Popen[Any]) -> None:
+        if process.poll() is not None:
+            return
         process.terminate()
-        profile_dir.cleanup()
-        raise BotError(f"无法连接外部浏览器 CDP: {last_error}")
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                pass
+
+    def cleanup_profile_dir(self, profile_dir: tempfile.TemporaryDirectory[str]) -> None:
+        try:
+            profile_dir.cleanup()
+        except Exception as exc:
+            self.log(f"临时浏览器 profile 清理失败: {exc}")
 
     def find_browser_executable(self, playwright: Any) -> str:
         if self.config.browser_executable_path:
