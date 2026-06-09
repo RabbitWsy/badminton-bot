@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -59,6 +60,9 @@ class Config:
     browser_channel: str
     browser_executable_path: str
     log_dir: Path
+    cdp_startup_attempts: int = 3
+    cdp_startup_timeout_seconds: float = 30
+    cdp_retry_delay_seconds: float = 1
     navigation_timeout_ms: int = 30000
     action_timeout_ms: int = 5000
 
@@ -125,6 +129,9 @@ def load_config(env_file: Path) -> Config:
         browser_channel=os.getenv("FUDAN_BROWSER_CHANNEL", "").strip(),
         browser_executable_path=os.getenv("FUDAN_BROWSER_EXECUTABLE_PATH", "").strip(),
         log_dir=root / os.getenv("FUDAN_LOG_DIR", "logs"),
+        cdp_startup_attempts=int(os.getenv("FUDAN_CDP_STARTUP_ATTEMPTS", "3")),
+        cdp_startup_timeout_seconds=float(os.getenv("FUDAN_CDP_STARTUP_TIMEOUT_SECONDS", "30")),
+        cdp_retry_delay_seconds=float(os.getenv("FUDAN_CDP_RETRY_DELAY_SECONDS", "1")),
     )
 
 
@@ -199,8 +206,14 @@ class FudanBadmintonBot:
                 self.log(f"失败: {exc}")
                 raise
             finally:
-                context.close()
-                browser.close()
+                try:
+                    context.close()
+                except Exception as exc:
+                    self.log(f"关闭浏览器 context 失败: {exc}")
+                try:
+                    browser.close()
+                except Exception as exc:
+                    self.log(f"关闭浏览器失败: {exc}")
                 if browser_process:
                     self.terminate_browser_process(browser_process)
                 if profile_dir:
@@ -212,35 +225,69 @@ class FudanBadmintonBot:
         context_kwargs: dict[str, Any],
     ) -> tuple[Any, Any, subprocess.Popen[Any], tempfile.TemporaryDirectory[str]]:
         executable = self.find_browser_executable(playwright)
-        profile_dir = tempfile.TemporaryDirectory(prefix="fudan-booking-profile-")
-        port = self.free_port()
-        args = [
-            executable,
-            f"--remote-debugging-port={port}",
-            f"--user-data-dir={profile_dir.name}",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-dev-shm-usage",
-            "--window-size=1440,1100",
-            "about:blank",
-        ]
-        if hasattr(os, "geteuid") and os.geteuid() == 0:
-            args.append("--no-sandbox")
-        process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        endpoint = f"http://127.0.0.1:{port}"
-        try:
-            ws_endpoint = self.wait_for_cdp_websocket(endpoint, process=process, timeout_seconds=10)
-            browser = playwright.chromium.connect_over_cdp(ws_endpoint, timeout=10000)
+        attempts = max(1, self.config.cdp_startup_attempts)
+        timeout_seconds = max(1.0, self.config.cdp_startup_timeout_seconds)
+        last_error: Exception | None = None
+
+        for attempt in range(1, attempts + 1):
+            profile_dir = tempfile.TemporaryDirectory(prefix="fudan-booking-profile-")
+            port = self.free_port()
+            stderr_path = self.browser_stderr_path(attempt)
+            args = [
+                executable,
+                "--remote-debugging-address=127.0.0.1",
+                f"--remote-debugging-port={port}",
+                f"--user-data-dir={profile_dir.name}",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--window-size=1440,1100",
+                "about:blank",
+            ]
+            if hasattr(os, "geteuid") and os.geteuid() == 0:
+                args.append("--no-sandbox")
+
+            popen_kwargs: dict[str, Any] = {}
+            if os.name == "posix":
+                popen_kwargs["start_new_session"] = True
+
+            with stderr_path.open("wb") as stderr_file:
+                process = subprocess.Popen(
+                    args,
+                    stdout=subprocess.DEVNULL,
+                    stderr=stderr_file,
+                    **popen_kwargs,
+                )
+
+            endpoint = f"http://127.0.0.1:{port}"
             try:
-                context = browser.new_context(**context_kwargs)
-            except Exception:
-                context = browser.contexts[0] if browser.contexts else browser.new_context()
-            self.log(f"已通过外部浏览器连接: {executable}")
-            return browser, context, process, profile_dir
-        except Exception:
-            self.terminate_browser_process(process)
-            self.cleanup_profile_dir(profile_dir)
-            raise
+                self.log(f"启动外部浏览器: 第 {attempt}/{attempts} 次，CDP 端口 {port}")
+                ws_endpoint = self.wait_for_cdp_websocket(
+                    endpoint,
+                    process=process,
+                    timeout_seconds=timeout_seconds,
+                )
+                browser = playwright.chromium.connect_over_cdp(ws_endpoint, timeout=10000)
+                try:
+                    context = browser.new_context(**context_kwargs)
+                except Exception:
+                    context = browser.contexts[0] if browser.contexts else browser.new_context()
+                self.log(f"已通过外部浏览器连接: {executable}")
+                return browser, context, process, profile_dir
+            except Exception as exc:
+                last_error = exc
+                self.terminate_browser_process(process)
+                self.log_browser_stderr_tail(stderr_path)
+                self.cleanup_profile_dir(profile_dir)
+                if attempt < attempts:
+                    self.log(
+                        f"外部浏览器启动失败: {exc}；"
+                        f"{self.config.cdp_retry_delay_seconds:g} 秒后重试。"
+                    )
+                    time.sleep(max(0, self.config.cdp_retry_delay_seconds))
+
+        raise BotError(f"外部浏览器启动失败，已重试 {attempts} 次: {last_error}")
 
     def wait_for_cdp_websocket(
         self,
@@ -270,21 +317,64 @@ class FudanBadmintonBot:
     def terminate_browser_process(self, process: subprocess.Popen[Any]) -> None:
         if process.poll() is not None:
             return
-        process.terminate()
+        self.signal_browser_process(process, signal.SIGTERM)
         try:
             process.wait(timeout=3)
         except subprocess.TimeoutExpired:
-            process.kill()
+            self.signal_browser_process(process, signal.SIGKILL)
             try:
                 process.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 pass
 
-    def cleanup_profile_dir(self, profile_dir: tempfile.TemporaryDirectory[str]) -> None:
+    def signal_browser_process(self, process: subprocess.Popen[Any], sig: signal.Signals) -> None:
         try:
-            profile_dir.cleanup()
+            if os.name == "posix":
+                os.killpg(process.pid, sig)
+            elif sig == signal.SIGTERM:
+                process.terminate()
+            else:
+                process.kill()
+        except OSError:
+            pass
+
+    def cleanup_profile_dir(self, profile_dir: tempfile.TemporaryDirectory[str]) -> None:
+        last_error: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                profile_dir.cleanup()
+                return
+            except Exception as exc:
+                last_error = exc
+                if attempt < 3:
+                    time.sleep(0.2 * attempt)
+
+        path = Path(profile_dir.name)
+        try:
+            shutil.rmtree(path, ignore_errors=True)
         except Exception as exc:
-            self.log(f"临时浏览器 profile 清理失败: {exc}")
+            last_error = exc
+        if path.exists():
+            self.log(f"临时浏览器 profile 清理失败: {last_error}")
+
+    def browser_stderr_path(self, attempt: int) -> Path:
+        stamp = datetime.now(self.tz).strftime("%Y%m%d-%H%M%S")
+        return self.config.log_dir / f"{stamp}-chromium-attempt-{attempt}.log"
+
+    def log_browser_stderr_tail(self, path: Path, *, max_chars: int = 3000) -> None:
+        try:
+            if not path.exists() or path.stat().st_size == 0:
+                return
+            with path.open("rb") as file:
+                size = path.stat().st_size
+                file.seek(max(0, size - max_chars))
+                text = file.read().decode("utf-8", errors="replace").strip()
+        except Exception as exc:
+            self.log(f"读取外部浏览器启动日志失败: {exc}")
+            return
+
+        if text:
+            self.log(f"外部浏览器启动日志: {path}\n{text}")
 
     def find_browser_executable(self, playwright: Any) -> str:
         if self.config.browser_executable_path:

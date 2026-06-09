@@ -68,9 +68,13 @@ FUDAN_OPEN_TIME=07:00:00
 FUDAN_SUBMIT_RESULT_TIMEOUT_MS=2000
 FUDAN_HEADLESS=false
 FUDAN_USE_CDP_BROWSER=true
+FUDAN_CDP_STARTUP_ATTEMPTS=3
+FUDAN_CDP_STARTUP_TIMEOUT_SECONDS=30
 ```
 
 实际部署时，让容器的主进程执行 `bash scripts/run-daily.sh`，或者在 `tmux`/`screen`/`nohup` 中运行它。
+
+Headed Chromium 启动失败时，脚本会自动重试并把浏览器 stderr 写到 `logs/*-chromium-attempt-*.log`，方便排查 Xvfb、系统依赖或浏览器包问题。
 
 ## 手动测试
 
