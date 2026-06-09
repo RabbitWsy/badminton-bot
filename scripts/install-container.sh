@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+PYTHON_BIN="${PYTHON_BIN:-}"
 PLAYWRIGHT_INSTALL_DEPS="${PLAYWRIGHT_INSTALL_DEPS:-auto}"
 
 case "$PLAYWRIGHT_INSTALL_DEPS" in
@@ -45,6 +45,22 @@ ensure_root_access() {
   sudo -v
 }
 
+create_venv() {
+  if command -v uv >/dev/null 2>&1; then
+    if [ -n "$PYTHON_BIN" ]; then
+      uv venv --clear --python "$PYTHON_BIN" .venv
+    else
+      uv venv --clear .venv
+    fi
+    return
+  fi
+
+  if ! "${PYTHON_BIN:-python3}" -m venv --clear .venv; then
+    echo "无法创建 .venv。请安装 uv，或在 Debian/Ubuntu 上安装 python3-venv 后重试。"
+    exit 2
+  fi
+}
+
 if [ ! -f ".env" ]; then
   cp .env.example .env
   echo "已创建 .env，请填写账号、密码和手机号后重新运行本脚本：${ROOT_DIR}/.env"
@@ -63,12 +79,22 @@ if [ "${#missing_keys[@]}" -gt 0 ]; then
   exit 2
 fi
 
-if [ ! -d ".venv" ]; then
-  "${PYTHON_BIN}" -m venv .venv
+if [ ! -x ".venv/bin/python" ]; then
+  create_venv
 fi
 
-.venv/bin/python -m pip install --upgrade pip
-.venv/bin/pip install -r requirements.txt
+if command -v uv >/dev/null 2>&1; then
+  uv pip install --python .venv/bin/python -r requirements.txt
+else
+  if ! .venv/bin/python -m pip --version >/dev/null 2>&1; then
+    if ! .venv/bin/python -m ensurepip --upgrade; then
+      echo "当前 .venv 没有 pip，且 ensurepip 不可用。请安装 uv，或安装 python3-venv 后删除 .venv 重试。"
+      exit 2
+    fi
+  fi
+  .venv/bin/python -m pip install --upgrade pip
+  .venv/bin/python -m pip install -r requirements.txt
+fi
 
 if [ "$PLAYWRIGHT_INSTALL_DEPS" = "true" ] || [ "$PLAYWRIGHT_INSTALL_DEPS" = "auto" ]; then
   ensure_root_access
