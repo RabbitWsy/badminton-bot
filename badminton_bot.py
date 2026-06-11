@@ -421,12 +421,12 @@ class FudanBadmintonBot:
         except Exception as exc:
             self.log(f"截图保存失败: {exc}")
 
-    def open_venue(self) -> None:
+    def open_venue(self, *, ready_timeout_ms: int = 8000) -> None:
         assert self.page is not None
         self.log(f"打开羽毛球场直达页: {self.config.venue_url}")
         self.page.goto(self.config.venue_url, wait_until="domcontentloaded")
         self.wait_network_idle(timeout_ms=10000)
-        self.wait_for_direct_page_ready()
+        self.wait_for_direct_page_ready(timeout_ms=ready_timeout_ms)
         self.dismiss_reading_notice(timeout_ms=2000)
 
     def wait_for_direct_page_ready(self, *, timeout_ms: int = 8000) -> None:
@@ -565,7 +565,9 @@ class FudanBadmintonBot:
             except BotError as exc:
                 if "没有在预约表格中找到目标日期" not in str(exc):
                     raise
-                self.log(f"暂未找到目标日期 {self.target_date}，刷新后继续重试。")
+                visible_dates = self.visible_booking_dates()
+                visible_text = ", ".join(visible_dates) if visible_dates else "无"
+                self.log(f"暂未找到目标日期 {self.target_date}，当前页面日期: {visible_text}，刷新后继续重试。")
                 time.sleep(max(0.1, self.config.retry_interval_seconds))
                 self.refresh_booking_page()
                 continue
@@ -589,13 +591,14 @@ class FudanBadmintonBot:
                         self.save_screenshot(f"booked-{slot.replace(':', '')}")
                         if len(booked) < self.config.max_slots:
                             self.reopen_venue_after_success()
-                            scope = self.ensure_target_date_visible()
+                            should_retry_immediately = True
+                            break
                     else:
                         self.log(f"{slot} 已点击但未确认成功，页面反馈: {text}")
                         self.close_transient_overlays()
                         self.reopen_venue_after_submit_failure()
-                        scope = self.ensure_target_date_visible()
-                        continue
+                        should_retry_immediately = True
+                        break
                 elif status == "would-click":
                     self.log(f"[dry-run] 会尝试预约 {slot}，单元格文本: {text}")
                 elif status == "unavailable":
@@ -634,22 +637,43 @@ class FudanBadmintonBot:
     def reopen_venue_after_success(self) -> None:
         assert self.page is not None
         self.log("预约成功后重新打开羽毛球场直达页，准备继续下一段。")
-        self.open_venue()
+        self.open_venue(ready_timeout_ms=1500)
 
     def reopen_venue_after_submit_failure(self) -> None:
         assert self.page is not None
         self.log("本次提交未成功，重新打开羽毛球场直达页以清空当前选择。")
-        self.open_venue()
+        self.open_venue(ready_timeout_ms=1500)
 
-    def ensure_target_date_visible(self) -> Any:
+    def ensure_target_date_visible(self, *, timeout_ms: int | None = None) -> Any:
         assert self.page is not None
-        for _ in range(5):
+        timeout_ms = timeout_ms or max(3000, self.config.page_settle_timeout_ms * 3)
+        deadline = time.time() + timeout_ms / 1000
+        week_turns = 0
+
+        while time.time() <= deadline:
             scope = self.scope_with_text(self.target_date)
             if scope:
                 return scope
-            if not self.click_first_text(["后一周", "下一周", "下周"], required=False):
-                break
-            self.wait_network_idle(timeout_ms=10000)
+
+            visible_dates = self.visible_booking_dates()
+            if week_turns < 5 and visible_dates:
+                if self.target_date < visible_dates[0]:
+                    if self.click_first_text(["前一周", "上一周", "上周"], required=False):
+                        week_turns += 1
+                        self.wait_network_idle(timeout_ms=1000)
+                        continue
+                elif self.target_date > visible_dates[-1]:
+                    if self.click_first_text(["后一周", "下一周", "下周"], required=False):
+                        week_turns += 1
+                        self.wait_network_idle(timeout_ms=1000)
+                        continue
+            elif week_turns < 5 and not visible_dates:
+                if self.click_first_text(["后一周", "下一周", "下周"], required=False):
+                    week_turns += 1
+                    self.wait_network_idle(timeout_ms=1000)
+                    continue
+
+            time.sleep(0.1)
         raise BotError(f"没有在预约表格中找到目标日期: {self.target_date}")
 
     def click_slot(self, scope: Any, slot: str) -> dict[str, str]:
@@ -1052,7 +1076,7 @@ class FudanBadmintonBot:
         try:
             self.page.reload(wait_until="domcontentloaded")
             self.wait_network_idle(timeout_ms=10000)
-            self.wait_for_direct_page_ready()
+            self.wait_for_direct_page_ready(timeout_ms=1500)
             self.dismiss_reading_notice(timeout_ms=100)
         except PlaywrightTimeoutError:
             pass
@@ -1219,6 +1243,10 @@ class FudanBadmintonBot:
             if self.locator_is_visible(locator, timeout_ms=300):
                 return scope
         return None
+
+    def visible_booking_dates(self) -> list[str]:
+        text = self.current_text(timeout_ms=100)
+        return sorted(set(re.findall(r"\b20\d{2}-\d{2}-\d{2}\b", text)))
 
     def scopes(self) -> list[Any]:
         assert self.page is not None
