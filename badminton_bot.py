@@ -667,12 +667,6 @@ class FudanBadmintonBot:
                         week_turns += 1
                         self.wait_network_idle(timeout_ms=1000)
                         continue
-            elif week_turns < 5 and not visible_dates:
-                if self.click_first_text(["后一周", "下一周", "下周"], required=False):
-                    week_turns += 1
-                    self.wait_network_idle(timeout_ms=1000)
-                    continue
-
             time.sleep(0.1)
         raise BotError(f"没有在预约表格中找到目标日期: {self.target_date}")
 
