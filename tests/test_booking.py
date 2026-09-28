@@ -4,7 +4,7 @@ import unittest
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from playwright.sync_api import Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
@@ -123,6 +123,55 @@ class RetryTests(BotTestCase):
         self.assertEqual(self.submitted_slots(), ["21:00-22:30", "20:00-21:00"])
         self.assertEqual(self.bot.pending_slots, {"21:00-22:30"})
 
+    def test_busy_with_one_slot_budget_retries_top_priority_after_backoff(self):
+        self.bot.config = replace(self.config, max_slots=1)
+        self.bot.submit_booking = Mock(side_effect=[
+            SubmitResult('busy', '前方拥挤请稍后再试'), SubmitResult('confirmed'),
+        ])
+        self.assertEqual(self.bot.book_with_retries(), ['21:00-22:30'])
+        self.assertEqual(self.submitted_slots(), ['21:00-22:30', '21:00-22:30'])
+        self.assertEqual(self.bot.pending_slots, set())
+        self.bot.retry_delay.assert_called_once_with(1, all_full=False)
+
+    def test_repeated_busy_responses_increase_backoff(self):
+        self.bot.config = replace(self.config, max_slots=1)
+        self.bot.submit_booking = Mock(side_effect=[
+            SubmitResult('busy'), SubmitResult('busy'), SubmitResult('confirmed'),
+        ])
+        self.assertEqual(self.bot.book_with_retries(), ['21:00-22:30'])
+        self.assertEqual([call.args[0] for call in self.bot.retry_delay.call_args_list], [1, 2])
+        self.assertEqual(self.submitted_slots(), ['21:00-22:30'] * 3)
+
+    def test_busy_retry_skips_top_slot_if_it_has_filled(self):
+        self.bot.config = replace(self.config, max_slots=1)
+        available = self.bot.read_slots.return_value
+        self.bot.read_slots.side_effect = [available, {
+            **available, '21:00-22:30': {'status': 'unavailable', 'text': '约满 (15/15)'},
+        }]
+        self.bot.submit_booking = Mock(side_effect=[SubmitResult('busy'), SubmitResult('confirmed')])
+        self.assertEqual(self.bot.book_with_retries(), ['20:00-21:00'])
+        self.assertEqual(self.submitted_slots(), ['21:00-22:30', '20:00-21:00'])
+
+    def test_unknown_with_one_slot_budget_still_prevents_duplicate_booking(self):
+        self.bot.config = replace(self.config, max_slots=1)
+        self.bot.submit_booking = Mock(return_value=SubmitResult('unknown'))
+        self.assertEqual(self.bot.book_with_retries(), [])
+        self.assertEqual(self.submitted_slots(), ['21:00-22:30'])
+        self.assertEqual(self.bot.pending_slots, {'21:00-22:30'})
+
+    def test_busy_does_not_extend_submission_deadline(self):
+        self.bot.booking_deadline = Mock(return_value=10)
+        clock = [0]
+        def submit(slot):
+            clock[0] = 11
+            return SubmitResult('busy')
+        self.bot.submit_booking = Mock(side_effect=submit)
+        with patch('badminton_bot.time.monotonic', side_effect=lambda: clock[0]):
+            self.assertEqual(self.bot.book_with_retries(), [])
+        self.assertEqual(self.submitted_slots(), ['21:00-22:30'])
+        self.assertEqual(self.bot.pending_slots, set())
+        self.bot.retry_delay.assert_not_called()
+
     def test_feedback_classification(self):
         cases = {
             "预约时段不可重叠": "conflict",
@@ -130,6 +179,11 @@ class RetryTests(BotTestCase):
             "剩余资源容量不足，请重新预约": "rejected",
             "预约成功": "unknown",  # A toast alone is not a verified appointment.
             "已预约/点击查看详情": "unknown",
+            "前方拥挤请稍后再试": "busy",
+            "前方拥挤，请稍后再试。": "busy",
+            "前方拥挤 请稍后再试": "busy",
+            "请求处理中，请稍后再试": "unknown",
+            "网络超时，请稍后再试": "unknown",
         }
         for feedback, status in cases.items():
             with self.subTest(feedback=feedback):
@@ -214,6 +268,49 @@ class BrowserTests(BotTestCase):
         self.page.set_content('<div class="el-message">已预约 点击查看详情</div>')
         result = self.bot.wait_for_submit_result("21:00-22:30", timeout_ms=100)
         self.assertEqual(result.status, "unknown")
+
+    def test_busy_feedback_returns_before_record_timeout(self):
+        self.page.set_content('<div class="el-message">前方拥挤请稍后再试</div>')
+        started = time.monotonic()
+        result = self.bot.wait_for_submit_result('21:00-22:30')
+        self.assertEqual(result.status, 'busy')
+        self.assertLess(time.monotonic() - started, 1.5)
+
+    def test_matching_record_takes_precedence_over_busy_feedback(self):
+        self.page.set_content('<div class="el-message">前方拥挤请稍后再试</div>' + self.record())
+        self.assertEqual(self.bot.wait_for_submit_result('21:00-22:30').status, 'confirmed')
+
+    def test_old_busy_feedback_is_not_attributed_to_new_submit(self):
+        self.page.set_content('<div class="el-message">前方拥挤请稍后再试</div>')
+        self.assertEqual(self.bot.wait_for_submit_result(
+            '21:00-22:30', baseline_feedback='前方拥挤请稍后再试', timeout_ms=100,
+        ).status, 'unknown')
+
+    def test_busy_then_success_through_browser_with_max_one_slot(self):
+        # Exercise selection, real button clicks, feedback and page reopening
+        # together. All requests are intercepted locally; no live reservations.
+        self.bot.config = replace(self.config, max_slots=1, wait_until_open=False,
+                                  venue_url='https://booking.test/calendar', retry_until_seconds=15)
+        self.bot.retry_delay = Mock(return_value=0)
+        submissions = []
+        html = self.calendar() + '''
+            <button onclick="fetch('/submit', {method:'POST', body:window.clicked})
+                .then(r=>r.json()).then(r=>document.getElementById('result').innerHTML=r.html)">确认预约</button>
+            <div id="result"></div>'''
+        def respond(route):
+            if route.request.url.endswith('/submit'):
+                submissions.append(route.request.post_data)
+                result = ('<div class="el-message">前方拥挤请稍后再试</div>'
+                          if len(submissions) == 1 else self.record())
+                route.fulfill(json={'html': result})
+            else:
+                route.fulfill(content_type='text/html; charset=utf-8', body=html)
+        self.page.route('https://booking.test/**', respond)
+        self.page.goto(self.bot.config.venue_url)
+        self.assertEqual(self.bot.book_with_retries(), ['21:00-22:30'])
+        self.assertEqual(submissions, ['21:00-22:30', '21:00-22:30'])
+        self.assertEqual(self.bot.pending_slots, set())
+        self.bot.retry_delay.assert_called_once_with(1, all_full=False)
 
     def test_record_must_match_date_venue_and_active_status(self):
         cases = [

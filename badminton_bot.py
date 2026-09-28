@@ -625,6 +625,10 @@ class FudanBadmintonBot:
         stop = False
         idle_rounds = 0
         full_rounds = 0
+        busy_rounds = 0
+        self.log(f"本轮最多预约 {self.config.max_slots} 个时段，"
+                 f"按顺序尝试: {', '.join(self.config.preferred_slots)}；"
+                 f"剩余提交窗口 {max(0, deadline - time.monotonic()):.1f} 秒。")
 
         def has_capacity() -> bool:
             return len(booked) + len(self.pending_slots) < self.config.max_slots
@@ -637,6 +641,7 @@ class FudanBadmintonBot:
             all_full = True
             checked = 0
             submitted = False
+            busy = False
             # Preserve the configured order on EVERY pass. Each slot is submitted
             # at most once per pass; definitive failures advance to the next slot.
             for slot in self.config.preferred_slots:
@@ -692,6 +697,7 @@ class FudanBadmintonBot:
                     continue
                 started = time.monotonic()
                 submitted = True
+                self.log(f"开始提交 {slot}，点击前余量: {selected.get('text', '')}")
                 result = self.submit_booking(slot)
                 self.log(f"{slot} 提交结果: {result.status}，耗时 {time.monotonic() - started:.2f} 秒，"
                          f"{result.feedback or '无明确反馈'}")
@@ -706,6 +712,14 @@ class FudanBadmintonBot:
                 elif result.status == "unknown":
                     self.pending_slots.add(slot)
                     self.log(f"{slot} 结果待核实，暂占一个预约名额，本轮不重复提交。")
+                elif result.status == "busy":
+                    # The site explicitly declined this request due to load.
+                    # Cool down before any more submissions, then preserve the
+                    # original priorities using a fresh availability snapshot.
+                    busy = True
+                    reopen = True
+                    self.log("网站提示拥挤，本次未获受理，不占预约名额；退避后按原优先级重试。")
+                    break
                 # Navigation clears the old selection and any previous feedback.
                 # Do it only when there is another candidate to inspect.
                 scope = None
@@ -723,7 +737,8 @@ class FudanBadmintonBot:
                 self.log(f"连续 {full_rounds} 轮确认剩余目标时段全部约满，正常结束检查。")
                 break
             idle_rounds = 0 if submitted else idle_rounds + 1
-            delay = min(self.retry_delay(idle_rounds, all_full=all_full),
+            busy_rounds = busy_rounds + 1 if busy else 0
+            delay = min(self.retry_delay(busy_rounds if busy else idle_rounds, all_full=all_full),
                         max(0, deadline - time.monotonic()))
             self.log(f"等待 {delay:.1f} 秒后再次检查。")
             time.sleep(delay)
@@ -869,6 +884,11 @@ class FudanBadmintonBot:
             "剩余资源容量不足", "最多预约1个时段",
         )):
             return "rejected"
+        # Keep this narrow: a network timeout or a processing message does NOT
+        # establish rejection and must still reserve capacity as "unknown".
+        normalized = re.sub(r"[\s，,。.!！]", "", feedback)
+        if "前方拥挤请稍后再试" in normalized:
+            return "busy"
         return "unknown"
 
     def wait_for_submit_result(
@@ -885,6 +905,9 @@ class FudanBadmintonBot:
         dialog_confirmed = False
 
         while time.monotonic() <= deadline:
+            record_text = self.confirmed_appointment_record_text(slot)
+            if record_text:
+                return SubmitResult("confirmed", "检测到目标日期、场馆和时段的待签到预约记录")
             feedback = self.feedback_text()
             new_feedback = self.feedback_without_baseline(feedback, baseline_feedback)
             if new_feedback:
@@ -893,9 +916,6 @@ class FudanBadmintonBot:
                 if status != "unknown":
                     return SubmitResult(status, new_feedback)
 
-            record_text = self.confirmed_appointment_record_text(slot)
-            if record_text:
-                return SubmitResult("confirmed", "检测到目标日期、场馆和时段的待签到预约记录")
             if confirm_dialog and not dialog_confirmed:
                 dialog_confirmed = self.confirm_submit_if_needed(timeout_ms=0)
             time.sleep(0.1)
